@@ -1,0 +1,17 @@
+{
+  "tasks": {
+    "dev": "deno run --env-file=.env --watch --allow-all main.ts",
+    "start": "deno run --allow-net --allow-read --allow-write=/etc/netplan --allow-env --allow-run=ip,netplan main.ts"
+  },
+  "imports": {
+    "@joyautomation/coral": "jsr:@joyautomation/coral@^0.0.12",
+    "@nats-io/transport-deno": "jsr:@nats-io/transport-deno@3",
+    "@nats-io/jetstream": "jsr:@nats-io/jetstream@3",
+    "@nats-io/kv": "jsr:@nats-io/kv@3",
+    "@std/yaml": "jsr:@std/yaml@1",
+    "@tentacle/nats-schema": "../tentacle-nats-schema/src/mod.ts"
+  },
+  "compilerOptions": {
+    "strict": true
+  }
+}
