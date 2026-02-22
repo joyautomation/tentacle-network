@@ -6,42 +6,23 @@ on:
       - 'v*.*.*'
 
 jobs:
-  compile:
-    strategy:
-      matrix:
-        target:
-          - { deno: x86_64-unknown-linux-gnu, platform: linux-amd64 }
-          - { deno: aarch64-unknown-linux-gnu, platform: linux-arm64 }
+  package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           path: tentacle-network
 
-      - uses: actions/checkout@v4
-        with:
-          repository: joyautomation/nats-schema
-          path: tentacle-nats-schema
-
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
-      - name: Compile for ${{ matrix.target.platform }}
-        run: |
-          cd tentacle-network
-          deno compile --allow-all \
-            --target ${{ matrix.target.deno }} \
-            --output ../dist/tentacle-network-${{ matrix.target.platform }} \
-            main.ts
+      - name: Package source
+        run: tar czf tentacle-network-src.tar.gz tentacle-network/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tentacle-network-${{ matrix.target.platform }}
-          path: dist/tentacle-network-*
+          name: tentacle-network-src
+          path: tentacle-network-src.tar.gz
 
   release:
-    needs: compile
+    needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
