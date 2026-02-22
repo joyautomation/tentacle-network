@@ -14,7 +14,7 @@ jobs:
           path: tentacle-network
 
       - name: Package source
-        run: tar czf tentacle-network-src.tar.gz tentacle-network/
+        run: tar czf tentacle-network-src.tar.gz --exclude='.git' tentacle-network/
 
       - uses: actions/upload-artifact@v4
         with:
