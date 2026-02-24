@@ -1,12 +1,13 @@
 /**
  * Network Metric Publisher
  *
- * Flattens NetworkInterface[] + NetworkInterfaceConfig[] into individual
- * PlcDataMessage publishes on network.data.{variableId}. Only publishes
- * when a metric value changes (change detection via previous value map).
+ * Publishes one Sparkplug B UDT message per network interface on
+ * network.data.{interfaceName}. The message carries the full interface
+ * state as a structured value with a NetworkInterfaceTemplate definition,
+ * so tentacle-mqtt can publish it as a proper Sparkplug B Template Instance.
  *
- * This allows tentacle-mqtt to pick up network metrics automatically
- * via its existing *.data.> subscription and bridge them to Sparkplug B.
+ * Only publishes when the interface's aggregated value changes
+ * (change detection via previous serialized value map).
  */
 
 import type { NatsConnection } from "@nats-io/transport-deno";
@@ -15,6 +16,7 @@ import type {
   NetworkInterfaceConfig,
   PlcDataMessage,
 } from "@tentacle/nats-schema";
+import { NetworkInterfaceTemplate } from "@tentacle/nats-schema";
 import { log } from "../utils/logger.ts";
 
 // Access logger dynamically so it picks up the wrapped logger after enableNatsLogging
@@ -23,8 +25,6 @@ const logger = {
   get debug() { return log.service.debug.bind(log.service); },
   get warn() { return log.service.warn.bind(log.service); },
 };
-
-type MetricValue = number | boolean | string;
 
 /** Prefixes of virtual/container interfaces to exclude from metric publishing */
 const VIRTUAL_INTERFACE_PREFIXES = [
@@ -42,139 +42,96 @@ function isVirtualInterface(name: string): boolean {
   return VIRTUAL_INTERFACE_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
-interface MetricDef {
-  variableId: string;
-  value: MetricValue;
-  datatype: "number" | "boolean" | "string";
-  description: string;
-}
-
-/** Previous metric values for change detection (variableId → serialized value) */
+/** Previous serialized values for change detection (interfaceName → JSON string) */
 const previousValues = new Map<string, string>();
 
 const encoder = new TextEncoder();
 
 /**
- * Serialize a value for comparison. Uses JSON.stringify for consistent
- * comparison of all types including strings with special characters.
+ * Build the flat UDT value object for a network interface.
+ * Array fields are JSON-stringified so all members are primitives.
  */
-function serialize(value: MetricValue): string {
-  return JSON.stringify(value);
+function buildInterfaceValue(
+  iface: NetworkInterface,
+  cfg: NetworkInterfaceConfig | undefined,
+): Record<string, unknown> {
+  return {
+    operstate: iface.operstate,
+    carrier: iface.carrier,
+    speed: iface.speed ?? 0,
+    duplex: iface.duplex ?? "unknown",
+    mac: iface.mac,
+    mtu: iface.mtu,
+    addresses: JSON.stringify(
+      iface.addresses.map((a) => `${a.address}/${a.prefixlen}`),
+    ),
+    rx_bytes: iface.statistics.rxBytes,
+    tx_bytes: iface.statistics.txBytes,
+    rx_packets: iface.statistics.rxPackets,
+    tx_packets: iface.statistics.txPackets,
+    rx_errors: iface.statistics.rxErrors,
+    tx_errors: iface.statistics.txErrors,
+    rx_dropped: iface.statistics.rxDropped,
+    tx_dropped: iface.statistics.txDropped,
+    config_dhcp4: cfg?.dhcp4 ?? false,
+    config_addresses: JSON.stringify(cfg?.addresses ?? []),
+    config_gateway4: cfg?.gateway4 ?? "",
+    config_nameservers: JSON.stringify(cfg?.nameservers ?? []),
+    config_mtu: cfg?.mtu ?? 0,
+  };
 }
 
 /**
- * Extract live status metrics from a NetworkInterface.
- */
-function extractLiveMetrics(iface: NetworkInterface): MetricDef[] {
-  const name = iface.name;
-  const metrics: MetricDef[] = [
-    { variableId: `${name}/operstate`, value: iface.operstate, datatype: "string", description: `${name} - Operational State` },
-    { variableId: `${name}/carrier`, value: iface.carrier, datatype: "boolean", description: `${name} - Carrier` },
-    { variableId: `${name}/speed`, value: iface.speed ?? 0, datatype: "number", description: `${name} - Speed (Mbps)` },
-    { variableId: `${name}/duplex`, value: iface.duplex ?? "unknown", datatype: "string", description: `${name} - Duplex` },
-    { variableId: `${name}/mac`, value: iface.mac, datatype: "string", description: `${name} - MAC Address` },
-    { variableId: `${name}/mtu`, value: iface.mtu, datatype: "number", description: `${name} - MTU` },
-  ];
-
-  // Flatten addresses to JSON array of CIDR strings
-  const addrList = iface.addresses.map(
-    (a) => `${a.address}/${a.prefixlen}`,
-  );
-  metrics.push({
-    variableId: `${name}/addresses`,
-    value: JSON.stringify(addrList),
-    datatype: "string",
-    description: `${name} - Addresses`,
-  });
-
-  return metrics;
-}
-
-/**
- * Extract config metrics from a NetworkInterfaceConfig.
- */
-function extractConfigMetrics(config: NetworkInterfaceConfig): MetricDef[] {
-  const name = config.interfaceName;
-  return [
-    { variableId: `${name}/config/dhcp4`, value: config.dhcp4 ?? false, datatype: "boolean", description: `${name} - DHCP4 Enabled` },
-    { variableId: `${name}/config/addresses`, value: JSON.stringify(config.addresses ?? []), datatype: "string", description: `${name} - Configured Addresses` },
-    { variableId: `${name}/config/gateway4`, value: config.gateway4 ?? "", datatype: "string", description: `${name} - Gateway` },
-    { variableId: `${name}/config/nameservers`, value: JSON.stringify(config.nameservers ?? []), datatype: "string", description: `${name} - Nameservers` },
-    { variableId: `${name}/config/mtu`, value: config.mtu ?? 0, datatype: "number", description: `${name} - Configured MTU` },
-  ];
-}
-
-/**
- * Publish changed network metrics as individual PlcDataMessage to NATS.
+ * Publish changed network interfaces as UDT PlcDataMessages to NATS.
  *
- * Called after each interface state poll. Compares current values to
- * previous and only publishes metrics that have changed.
+ * Each interface is published as a single message with datatype "udt"
+ * and a NetworkInterfaceTemplate definition, enabling tentacle-mqtt to
+ * create a proper Sparkplug B Template Instance metric.
  *
- * @returns Number of metrics published
+ * @returns Number of interfaces published
  */
 export function publishNetworkMetrics(
   nc: NatsConnection,
   interfaces: NetworkInterface[],
   configs: NetworkInterfaceConfig[],
 ): number {
-  const allMetrics: MetricDef[] = [];
-
-  // Build config lookup by interface name
   const configMap = new Map<string, NetworkInterfaceConfig>();
   for (const cfg of configs) {
     configMap.set(cfg.interfaceName, cfg);
   }
 
-  for (const iface of interfaces) {
-    // Skip loopback and virtual/container interfaces
-    if (iface.name === "lo" || isVirtualInterface(iface.name)) continue;
-
-    // Live status metrics
-    allMetrics.push(...extractLiveMetrics(iface));
-
-    // Config metrics (if config exists for this interface)
-    const cfg = configMap.get(iface.name);
-    if (cfg) {
-      allMetrics.push(...extractConfigMetrics(cfg));
-    }
-  }
-
-  // Also publish config metrics for interfaces that don't appear in live state
-  // (shouldn't happen normally, but be defensive)
-  for (const cfg of configs) {
-    if (!interfaces.some((i) => i.name === cfg.interfaceName)) {
-      allMetrics.push(...extractConfigMetrics(cfg));
-    }
-  }
-
   let publishCount = 0;
 
-  for (const metric of allMetrics) {
-    const serialized = serialize(metric.value);
-    const prev = previousValues.get(metric.variableId);
+  for (const iface of interfaces) {
+    if (iface.name === "lo" || isVirtualInterface(iface.name)) continue;
 
-    // Only publish if value changed
-    if (prev === serialized) continue;
+    const cfg = configMap.get(iface.name);
+    const value = buildInterfaceValue(iface, cfg);
+    const serialized = JSON.stringify(value);
 
-    previousValues.set(metric.variableId, serialized);
+    if (previousValues.get(iface.name) === serialized) continue;
+    previousValues.set(iface.name, serialized);
 
     const msg: PlcDataMessage = {
       moduleId: "network",
       deviceId: "network",
-      variableId: metric.variableId,
-      value: metric.value,
+      variableId: iface.name,
+      value,
+      datatype: "udt",
+      udtTemplate: NetworkInterfaceTemplate,
+      description: `Network interface ${iface.name}`,
       timestamp: Date.now(),
-      datatype: metric.datatype,
-      description: metric.description,
     };
 
-    const subject = `network.data.${metric.variableId}`;
-    nc.publish(subject, encoder.encode(JSON.stringify(msg)));
+    nc.publish(
+      `network.data.${iface.name}`,
+      encoder.encode(JSON.stringify(msg)),
+    );
     publishCount++;
   }
 
   if (publishCount > 0) {
-    logger.debug(`Published ${publishCount} changed network metric(s)`);
+    logger.debug(`Published ${publishCount} changed network interface(s)`);
   }
 
   return publishCount;
