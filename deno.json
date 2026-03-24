@@ -9,7 +9,7 @@
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3",
     "@nats-io/kv": "jsr:@nats-io/kv@3",
     "@std/yaml": "jsr:@std/yaml@1",
-    "@tentacle/nats-schema": "jsr:@joyautomation/tentacle-nats-schema@^0.0.4"
+    "@tentacle/nats-schema": "jsr:@joyautomation/tentacle-nats-schema@^0.0.8"
   },
   "compilerOptions": {
     "strict": true
